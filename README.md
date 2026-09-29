@@ -10,7 +10,9 @@ Push these files to the `main` branch of a new public GitHub repository. The
 workflow builds upstream stable releases starting at **v1.0.11**, the current
 release when this builder was created. It checks daily at **09:23 UTC**, skips
 versions already published, and processes all missing releases above that floor.
-It also runs when workflow/build scripts change. No NAS deployment occurs.
+It also runs when workflow/build scripts change, rebuilding the newest release
+so those changes are tested even if that version was already published. No NAS
+deployment occurs.
 
 Images are published as:
 
@@ -43,11 +45,18 @@ UBI base tags float to their latest patches; published version tags can be
 replaced by an explicit manual rebuild. Pin an image digest for deployment if
 you need immutable rollback targets.
 
-Before publishing, it verifies the runtime identifies itself as UBI 9 and starts
-ContextForge with temporary SQLite storage and random test credentials. A health
-check must pass. The test uses the same single-process Uvicorn entrypoint used
-for the personal TrueNAS deployment. Upstream's default entrypoint is preserved
-in the published image, so keep the Uvicorn override in the TrueNAS configuration.
+Before publishing, it verifies the runtime identifies itself as UBI 9 and tests
+both the default Gunicorn entrypoint (two workers) and the single-process Uvicorn
+entrypoint used for TrueNAS. Each test uses disposable SQLite storage and random
+Base64 credentials, with the admin UI and authentication enabled. Both must
+return a healthy JSON payload, render the admin login page, and have no matched
+startup errors in their logs. Startup logs are retained as workflow artifacts.
+
+All external Actions are pinned to commit SHAs. Syft generates an SPDX SBOM,
+and Grype blocks publication on HIGH or CRITICAL vulnerabilities with available
+fixes (`only-fixed: true`). Unfixed vulnerabilities are outside that gate. The
+SBOM is retained for 30 days. These checks use this rebuilt UBI 9 image, not the
+upstream UBI 10 image. The image is not currently signed with Cosign.
 
 The hosted runner supports newer CPU instructions: passing this smoke test does
 not prove compatibility with the NAS CPU. Verify the first image on the NAS.

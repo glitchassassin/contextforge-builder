@@ -43,6 +43,7 @@ def main():
     if requested and not candidates:
         raise SystemExit("Manual tag must name a published stable upstream release")
     candidates.sort()
+    force_latest = os.environ.get("FORCE_LATEST", "false").lower() == "true"
     owner = os.environ["GITHUB_REPOSITORY_OWNER"]
     package = os.environ.get("IMAGE_NAME", "contextforge")
     existing = set()
@@ -63,7 +64,8 @@ def main():
     pending = [{"tag": tag, "image_tag": ".".join(map(str, version)) + "-ubi9",
                 "latest": tag == candidates[-1][1]}
                for version, tag in candidates
-               if requested or ".".join(map(str, version)) + "-ubi9" not in existing]
+               if requested or (force_latest and tag == candidates[-1][1])
+               or ".".join(map(str, version)) + "-ubi9" not in existing]
     if len(pending) > 256:
         raise SystemExit("Too many pending releases for a workflow matrix")
     result = {"include": pending}

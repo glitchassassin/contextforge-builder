@@ -31,11 +31,14 @@ jobs:
       matrix: ${{ steps.releases.outputs.matrix }}
       has_builds: ${{ steps.releases.outputs.has_builds }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
       - id: releases
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.release_tag }}
+          FORCE_LATEST: ${{ github.event_name == 'push' }}
         run: python3 scripts/releases.py
 
   build:
@@ -51,10 +54,11 @@ jobs:
       max-parallel: 1
       matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           path: builder
-      - uses: actions/checkout@v4
+          persist-credentials: false
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           repository: IBM/mcp-context-forge
           ref: ${{ matrix.tag }}
@@ -63,14 +67,14 @@ jobs:
       - id: source
         working-directory: upstream
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build amd64 test image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: upstream
           file: upstream/Containerfile
@@ -93,8 +97,42 @@ jobs:
           cache-to: type=gha,mode=max,scope=ubi9-amd64
       - name: Verify UBI 9 base
         run: docker run --rm --entrypoint /bin/sh contextforge-ubi9:test -c 'grep -Eq "release 9[.]" /etc/redhat-release'
-      - name: Test application startup
-        run: bash builder/scripts/smoke-test.sh contextforge-ubi9:test
+      - name: Test default entrypoint
+        run: bash builder/scripts/smoke-test.sh contextforge-ubi9:test default
+      - name: Test TrueNAS Uvicorn entrypoint
+        run: bash builder/scripts/smoke-test.sh contextforge-ubi9:test uvicorn
+      - name: Upload startup logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: smoke-logs-${{ matrix.image_tag }}
+          path: smoke-logs/
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Generate image SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: contextforge-ubi9:test
+          output-file: sbom.spdx.json
+          upload-artifact: false
+      - name: Scan for fixable high and critical vulnerabilities
+        id: scan
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+        with:
+          sbom: sbom.spdx.json
+          only-fixed: true
+          fail-build: true
+          severity-cutoff: high
+          cache-db: true
+          output-format: table
+      - name: Upload image SBOM
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sbom-${{ matrix.image_tag }}
+          path: sbom.spdx.json
+          if-no-files-found: ignore
+          retention-days: 30
       - name: Publish tested image
         env:
           OWNER: ${{ github.repository_owner }}
