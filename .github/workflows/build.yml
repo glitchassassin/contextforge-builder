@@ -1,0 +1,114 @@
+name: Build ContextForge on UBI 9
+
+on:
+  schedule:
+    - cron: '23 9 * * *' # Daily, 09:23 UTC; avoid the busy top of the hour.
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Optional exact stable upstream tag; forces a rebuild'
+        required: false
+        type: string
+  push:
+    branches: [main]
+    paths: ['.github/workflows/build.yml', 'scripts/**']
+
+concurrency:
+  group: contextforge-ubi9-publisher
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: read
+
+env:
+  IMAGE_NAME: contextforge
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.releases.outputs.matrix }}
+      has_builds: ${{ steps.releases.outputs.has_builds }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: python3 scripts/releases.py
+
+  build:
+    needs: discover
+    if: needs.discover.outputs.has_builds == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: builder
+      - uses: actions/checkout@v4
+        with:
+          repository: IBM/mcp-context-forge
+          ref: ${{ matrix.tag }}
+          path: upstream
+          persist-credentials: false
+      - id: source
+        working-directory: upstream
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build amd64 test image
+        uses: docker/build-push-action@v6
+        with:
+          context: upstream
+          file: upstream/Containerfile
+          platforms: linux/amd64
+          load: true
+          tags: contextforge-ubi9:test
+          build-args: |
+            UBI_BASE=registry.access.redhat.com/ubi9/ubi:latest
+            NODEJS_IMAGE=registry.access.redhat.com/ubi9/nodejs-20:latest
+            UBI_MINIMAL=registry.access.redhat.com/ubi9/ubi-minimal:latest
+            ENABLE_RUST=false
+            ENABLE_FIPS=false
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.source.outputs.sha }}
+            org.opencontainers.image.version=${{ matrix.tag }}
+            org.opencontainers.image.licenses=Apache-2.0
+            io.contextforge.upstream=https://github.com/IBM/mcp-context-forge
+          cache-from: type=gha,scope=ubi9-amd64
+          cache-to: type=gha,mode=max,scope=ubi9-amd64
+      - name: Verify UBI 9 base
+        run: docker run --rm --entrypoint /bin/sh contextforge-ubi9:test -c 'grep -Eq "release 9[.]" /etc/redhat-release'
+      - name: Test application startup
+        run: bash builder/scripts/smoke-test.sh contextforge-ubi9:test
+      - name: Publish tested image
+        env:
+          OWNER: ${{ github.repository_owner }}
+          VERSION: ${{ matrix.image_tag }}
+          IS_LATEST: ${{ matrix.latest }}
+          MANUAL_TAG: ${{ inputs.release_tag }}
+        run: |
+          image="ghcr.io/${OWNER,,}/${IMAGE_NAME}"
+          # Manual rebuilding an older version must never move latest backwards.
+          if [ "$IS_LATEST" = true ] && [ -z "$MANUAL_TAG" ]; then
+            docker tag contextforge-ubi9:test "$image:latest"
+            docker push "$image:latest"
+          fi
+          # Publish the version last: discovery treats it as the completion marker.
+          docker tag contextforge-ubi9:test "$image:$VERSION"
+          docker push "$image:$VERSION"
+          echo "Published $image:$VERSION" >> "$GITHUB_STEP_SUMMARY"
