@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+builder_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 image=${1:?Usage: smoke-test.sh IMAGE [default|uvicorn]}
 mode=${2:-default}
 case "$mode" in default|uvicorn) ;; *) echo "Unknown startup mode: $mode" >&2; exit 2 ;; esac
@@ -66,6 +67,8 @@ if [ "$healthy" != true ]; then
 fi
 docker exec "$name" /app/.venv/bin/python -c \
   "import httpx; r=httpx.get('http://127.0.0.1:4444/admin/login',timeout=10); r.raise_for_status(); assert r.status_code == 200 and 'Sign In - ContextForge' in r.text, 'Admin login page failed to render'"
+docker cp "$builder_dir/tests/test_oauth_scopes.py" "$name:/tmp/test_oauth_scopes.py"
+docker exec "$name" /app/.venv/bin/python /tmp/test_oauth_scopes.py --live
 docker logs "$name" > "$log_dir/$mode.log" 2>&1
 if grep -E 'Control server error|Read-only file system|SIGKILL|Perhaps out of memory|^Traceback \(most recent call last\)' "$log_dir/$mode.log"; then
   echo "Container logged startup/runtime errors ($mode)" >&2

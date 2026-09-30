@@ -1,16 +1,14 @@
 # ContextForge UBI 9 builder
 
 Unofficial amd64 builds of IBM ContextForge for machines that cannot run its
-UBI 10 / x86-64-v3 image. Intended repository:
-`glitchassassin/contextforge-builder`.
+UBI 10 / x86-64-v3 image. Repository: `glitchassassin/contextforge-builder`.
 
 ## Publishing
 
-Push these files to the `main` branch of a new public GitHub repository. The
-workflow builds upstream stable releases starting at **v1.0.11**, the current
+The workflow builds upstream stable releases starting at **v1.0.11**, the current
 release when this builder was created. It checks daily at **09:23 UTC**, skips
 versions already published, and processes all missing releases above that floor.
-It also runs when workflow/build scripts change, rebuilding the newest release
+It also runs when workflow, scripts, patches, or regression tests change, rebuilding the newest release
 so those changes are tested even if that version was already published. No NAS
 deployment occurs.
 
@@ -38,8 +36,11 @@ dispatch remains available. Scheduled runs can be delayed by GitHub.
 
 ## Build and validation
 
-The workflow checks out the upstream release tag and records its resolved commit
-in image labels. It uses the upstream Containerfile, overriding its builder,
+The workflow checks out the upstream release tag and applies the compatibility
+patches in `patches/`. Patch application fails if the source has changed
+incompatibly. Review the patch when upstream incorporates an equivalent fix.
+Image labels record the upstream commit, builder commit, and patch digest.
+It uses the upstream Containerfile, overriding its builder,
 Node.js builder, and runtime to Red Hat UBI 9 images. Rust and FIPS are disabled.
 UBI base tags float to their latest patches; published version tags can be
 replaced by an explicit manual rebuild. Pin an image digest for deployment if
@@ -51,6 +52,10 @@ entrypoint used for TrueNAS. Each test uses disposable SQLite storage and random
 Base64 credentials, with the admin UI and authentication enabled. Both must
 return a healthy JSON payload, render the admin login page, and have no matched
 startup errors in their logs. Startup logs are retained as workflow artifacts.
+Both startup modes also verify OAuth scope challenges over HTTP against a
+temporary virtual server. Container regression tests use fresh RSA keys to check
+signed access tokens, rejection paths, and database-derived user permissions.
+These tests run without network access or production data.
 
 All external Actions are pinned to commit SHAs. Syft generates an SPDX SBOM,
 and Grype blocks publication on HIGH or CRITICAL vulnerabilities with available
@@ -60,8 +65,36 @@ upstream UBI 10 image. The image is not currently signed with Cosign.
 
 The hosted runner supports newer CPU instructions: passing this smoke test does
 not prove compatibility with the NAS CPU. Verify the first image on the NAS.
-This workflow has been statically checked but has not yet completed a GitHub
-build. Future upstream changes may require adjustments to the UBI 9 overrides.
+Future upstream changes may require adjustments to the UBI 9 overrides and patches.
+
+## OAuth scope compatibility patch
+
+ContextForge v1.0.11 omits scope guidance from its `WWW-Authenticate` challenges.
+Its missing-email response also omits the OAuth challenge entirely. Auth0 requires
+an `email` grant before an Action can add the plain `email` access-token claim.
+A client that requests no email scope can therefore authenticate at Auth0 and
+then fail MCP discovery with `OAuth token missing valid email claim`.
+
+The patch advertises each virtual server's configured `scopes_supported` (or
+legacy `scopes`) in initial and rejected-token challenges. Configure the minimal
+list `["openid", "email"]` for the Auth0 endpoint. The resulting challenge includes
+`scope="openid email"`. It omits `offline_access`, which is a client refresh-token
+request rather than a resource requirement, and rejects unsafe scope strings.
+No scopes are hard-coded for servers without this configuration.
+
+Keep the existing Auth0 Action that adds `email` to the access token for the MCP
+API. A fresh authorization grant is required; an existing token will not acquire
+the missing claim. The patch does not invent an email, auto-create users, or
+change signature, issuer, audience, expiration, local-account, or RBAC validation.
+
+The container tests validate challenge behavior and signed-token authentication.
+They do not prove that a particular ChatGPT/Auth0 authorization flow requested
+and granted the scopes. Verify that separately after deployment by reconnecting
+the MCP integration with a fresh authorization.
+
+References:
+- https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization
+- https://auth0.com/docs/troubleshoot/product-lifecycle/past-migrations/custom-claims-migration
 
 Source: https://github.com/IBM/mcp-context-forge (Apache-2.0).
 This repository contains build automation, not a maintained source-code fork.

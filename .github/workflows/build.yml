@@ -11,7 +11,7 @@ on:
         type: string
   push:
     branches: [main]
-    paths: ['.github/workflows/build.yml', 'scripts/**']
+    paths: ['.github/workflows/build.yml', 'scripts/**', 'patches/**', 'tests/**']
 
 concurrency:
   group: contextforge-ubi9-publisher
@@ -67,6 +67,11 @@ jobs:
       - id: source
         working-directory: upstream
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Apply OAuth compatibility patches
+        id: patches
+        run: |
+          bash builder/scripts/apply-patches.sh upstream
+          echo "sha256=$(cat builder/patches/*.patch | sha256sum | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
@@ -93,10 +98,14 @@ jobs:
             org.opencontainers.image.version=${{ matrix.tag }}
             org.opencontainers.image.licenses=Apache-2.0
             io.contextforge.upstream=https://github.com/IBM/mcp-context-forge
+            io.contextforge.builder.revision=${{ github.sha }}
+            io.contextforge.patches.sha256=${{ steps.patches.outputs.sha256 }}
           cache-from: type=gha,scope=ubi9-amd64
           cache-to: type=gha,mode=max,scope=ubi9-amd64
       - name: Verify UBI 9 base
         run: docker run --rm --entrypoint /bin/sh contextforge-ubi9:test -c 'grep -Eq "release 9[.]" /etc/redhat-release'
+      - name: Test OAuth scope challenges and token validation
+        run: bash builder/scripts/test-oauth.sh contextforge-ubi9:test
       - name: Test default entrypoint
         run: bash builder/scripts/smoke-test.sh contextforge-ubi9:test default
       - name: Test TrueNAS Uvicorn entrypoint

@@ -1,0 +1,113 @@
+diff --git a/mcpgateway/services/oauth_manager.py b/mcpgateway/services/oauth_manager.py
+index fc56425..513987e 100644
+--- a/mcpgateway/services/oauth_manager.py
++++ b/mcpgateway/services/oauth_manager.py
+@@ -2159,15 +2159,17 @@ class OAuthRequiredError(OAuthError):
+         True
+     """
+ 
+-    def __init__(self, message: str, *, server_id: str = "") -> None:
++    def __init__(self, message: str, *, server_id: str = "", scopes: Optional[List[str]] = None) -> None:
+         """Initialize with message and optional server_id.
+ 
+         Args:
+             message: Human-readable error description.
+             server_id: Virtual-server identifier that triggered the rejection.
++            scopes: Configured scopes to include in the authorization challenge.
+         """
+         super().__init__(message)
+         self.server_id = server_id
++        self.scopes = scopes
+ 
+ 
+ class OAuthEnforcementUnavailableError(OAuthError):
+diff --git a/mcpgateway/transports/streamablehttp_transport.py b/mcpgateway/transports/streamablehttp_transport.py
+index f247c3d..a0b7274 100644
+--- a/mcpgateway/transports/streamablehttp_transport.py
++++ b/mcpgateway/transports/streamablehttp_transport.py
+@@ -1038,6 +1038,31 @@ def _build_resource_metadata_url(scope: Scope, server_id: str) -> str:
+     return f"{base}/.well-known/oauth-protected-resource/servers/{server_id}/mcp"
+ 
+ 
++def _build_oauth_challenge(scope: Scope, server_id: str, scopes: Optional[list[str]] = None) -> str:
++    """Build an OAuth challenge with configured scope guidance.
++
++    Args:
++        scope: ASGI connection scope.
++        server_id: Virtual-server identifier.
++        scopes: Minimal scopes configured for the resource.
++
++    Returns:
++        Bearer challenge with resource metadata and valid RFC 6749 scope tokens.
++    """
++    resource_metadata = _build_resource_metadata_url(scope, server_id)
++    challenge = f'Bearer resource_metadata="{resource_metadata}"' if resource_metadata else "Bearer"
++    if not isinstance(scopes, list) or not scopes:
++        return challenge
++    # RFC 6749 scope tokens exclude whitespace, quotes, backslashes, and non-ASCII characters.
++    if any(not isinstance(value, str) or not re.fullmatch(r"[\x21\x23-\x5b\x5d-\x7e]+", value) for value in scopes):
++        logger.warning("Invalid OAuth challenge scopes configured for server %s", sanitize_for_log(server_id))
++        return challenge
++    required = list(dict.fromkeys(value for value in scopes if value != "offline_access"))
++    if required:
++        challenge += f', scope="{" ".join(required)}"'
++    return challenge
++
++
+ def _is_valid_audience(value: Any) -> bool:
+     """Return True if ``value`` is an RFC 7519-compliant ``aud`` claim.
+ 
+@@ -1186,9 +1211,11 @@ async def _check_server_oauth_enforcement(server_id: str, user_context: Optional
+             server = db.execute(select(DbServer).where(DbServer.id == server_id)).scalar_one_or_none()
+             if server and server.oauth_enabled:
+                 logger.warning("OAuth required for server %s but caller is unauthenticated", server_id)
++                oauth_config = server.oauth_config if isinstance(server.oauth_config, dict) else {}
+                 raise OAuthRequiredError(
+                     "This server requires OAuth authentication. Please provide a valid access token.",
+                     server_id=server_id,
++                    scopes=oauth_config.get("scopes_supported") or oauth_config.get("scopes"),
+                 )
+             _oauth_checked_var.set(True)
+     except SQLAlchemyError as exc:
+@@ -5535,9 +5562,8 @@ class _StreamableHttpAuthHandler:
+             per_server_id = match.group("server_id")
+             try:
+                 await _check_server_oauth_enforcement(per_server_id, {"is_authenticated": False})
+-            except OAuthRequiredError:
+-                resource_metadata = _build_resource_metadata_url(self.scope, per_server_id)
+-                www_auth = f'Bearer resource_metadata="{resource_metadata}"' if resource_metadata else "Bearer"
++            except OAuthRequiredError as exc:
++                www_auth = _build_oauth_challenge(self.scope, per_server_id, exc.scopes)
+                 return await self._send_error(detail="This server requires OAuth authentication", headers={"WWW-Authenticate": www_auth})
+             except OAuthEnforcementUnavailableError:
+                 logger.exception("OAuth enforcement check failed for server %s", per_server_id)
+@@ -6024,8 +6050,7 @@ class _StreamableHttpAuthHandler:
+                     "Server %s has no resource or client_id configured and no canonical resource URL could be derived; rejecting OAuth token",
+                     server_id_log,
+                 )
+-                resource_metadata = _build_resource_metadata_url(self.scope, server_id)
+-                www_auth = f'Bearer resource_metadata="{resource_metadata}"' if resource_metadata else "Bearer"
++                www_auth = _build_oauth_challenge(self.scope, server_id, server.oauth_config.get("scopes_supported") or server.oauth_config.get("scopes"))
+                 await self._send_error(detail="Invalid OAuth access token", headers={"WWW-Authenticate": www_auth})
+                 return OAuthAuthResult.FAILED
+             expected_audience = fallback_audiences[0] if len(fallback_audiences) == 1 else fallback_audiences
+@@ -6033,8 +6058,7 @@ class _StreamableHttpAuthHandler:
+         claims = await verify_oauth_access_token(token, authorization_servers, expected_audience=expected_audience)
+ 
+         if claims is None:
+-            resource_metadata = _build_resource_metadata_url(self.scope, server_id)
+-            www_auth = f'Bearer resource_metadata="{resource_metadata}"' if resource_metadata else "Bearer"
++            www_auth = _build_oauth_challenge(self.scope, server_id, server.oauth_config.get("scopes_supported") or server.oauth_config.get("scopes"))
+             await self._send_error(detail="Invalid OAuth access token", headers={"WWW-Authenticate": www_auth})
+             return OAuthAuthResult.FAILED
+ 
+@@ -6050,7 +6074,8 @@ class _StreamableHttpAuthHandler:
+         # Resolve user identity from verified claims
+         user_email = claims.get("email") or claims.get("preferred_username") or claims.get("sub")
+         if not user_email or not isinstance(user_email, str) or "@" not in user_email:
+-            await self._send_error(detail="OAuth token missing valid email claim")
++            www_auth = _build_oauth_challenge(self.scope, server_id, server.oauth_config.get("scopes_supported") or server.oauth_config.get("scopes"))
++            await self._send_error(detail="OAuth token missing valid email claim", headers={"WWW-Authenticate": www_auth})
+             return OAuthAuthResult.FAILED
+ 
+         user_email = user_email.strip().lower()
